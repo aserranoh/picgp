@@ -1,0 +1,68 @@
+picgp - PIC microcontrollers program loader using the Linux GPIO.
+
+  Copyright (C) 2016  Antonio Serrano Hernandez
+
+  Copying and distribution of this file, with or without modification,
+  are permitted in any medium without royalty provided the copyright
+  notice and this notice are preserved.
+
+picgp is provided "as is" with no warranty.  The exact terms
+under which you may use and (re)distribute this program are detailed
+in the GNU General Public License, in the file COPYING.
+
+# Overview
+
+picgp is a programmer for Microchip PIC microcontrollers that uses the
+computer's GPIO port to download the program into the microcontroller.
+
+# Building and Installing picgp
+
+To build and install picgp, just execute the command:
+
+    sudo python setup.py install
+
+# Usage
+
+For example, if you have the Vpp pin connectec to the GPIO pin 18, PGC to the
+23 and PGD to the 24, and you want to download the file text.hex into your
+pic18f2550, you could execute this command:
+
+    picgp -p p18f26j13 -C 23 -D 24 -V 18 test.hex
+
+If you want to use the Low Voltage Programming mode available in some
+processors, you have to give as well the PGM pin using the option -M.
+
+Some options can also be included in the file $HOME/.picgp.conf to avoid
+writing them every time you execute the command. For example, the possible
+contents of this file may be:
+
+    pgc=23
+    pgd=24
+    vpp=18
+    processor=p18f26j13
+
+Then, the above command would become:
+
+    picgp test.hex
+
+See the man page available for the complete list of options.
+Use the option -l to see the complete list of supported processors.
+
+# Notes
+
+Beware that if you want to use the High Voltage Programming mode available
+in some processors, you cannot connect the vpp GPIO pin direct to the Vpp
+processor pin. You must use it to drive some circuit to feed 11 or 12 V to
+the Vpp/MCLR pin (for example using an open collector identity gate).
+
+This program accesses the GPIO through the sysfs interface provided by the
+Linux kernel. Normal users don't have permissions to access the GPIO interface
+in sysfs by default. So in order to use picgp either the administrator
+provides a way for a normal user to access this interface (for example using
+udev to modify the default permissions in the sysfs files), or picgp is
+executed as superuser.
+
+# Bug report
+
+Send bug reports to toni.serranoh@gmail.com.
+

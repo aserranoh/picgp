@@ -1,0 +1,808 @@
+#!/usr/bin/env python
+
+'''PIC microcontrollers program loader using the Linux GPIO.
+
+Copyright 2016 Antonio Serrano Hernandez
+
+picgp is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+picgp is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with picgp; see the file COPYING.  If not, see
+<http://www.gnu.org/licenses/>.
+'''
+
+from __future__ import print_function
+import argparse
+import intelhex
+import mmap
+import os
+from os import read, write, lseek, SEEK_SET
+import struct
+import sys
+import time
+import timeit
+
+__script__ = 'picgp'
+__author__ = 'Antonio Serrano Hernandez'
+__copyright__ = 'Copyright (C) 2016 Antonio Serrano Hernandez'
+__version__ = '0.1.0'
+__license__ = 'GPL'
+__maintainer__ = 'Antonio Serrano Hernandez'
+__email__ = 'toni.serranoh@gmail.com'
+__status__ = 'Development'
+__homepage__ = 'https://github.com/aserranoh/picgp'
+
+VERSION_STRING = '''\
+%(prog)s {version}
+{copyright}
+License GPLv3+: GNU GPL version 3 or later <http://gnu.org/licenses/gpl.html>
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.\
+'''.format(version=__version__, copyright=__copyright__)
+
+HELP_EPILOG = '''\
+Report bugs to: {email}
+picc home page: {homepage}
+'''.format(email=__email__, homepage=__homepage__)
+
+# Declare the ANSI escape sequences to use some colors in the terminal output.
+# Only use this sequences if the standard output goes to a terminal.
+if sys.stdout.isatty():
+    RED = '\033[31m'
+    YELLOW = '\033[33m'
+    BOLD = '\033[1m'
+    RESET = '\033[0m'
+else:
+    RED = ''
+    YELLOW = ''
+    BOLD = ''
+    RESET = ''
+
+class Messages(object):
+    '''Prints info and error messages on the screen.'''
+    # verbose: static variable used to print info messages or not
+    verbose = False
+    @staticmethod
+    def error(msg):
+        '''Prints a fatal error and exits.'''
+        print('{b}{prog}: {r}error:{re} {msg}'.format(prog=__script__, msg=msg,
+            b=BOLD, r=RED, re=RESET), file=sys.stderr)
+        sys.exit(1)
+    @staticmethod
+    def warn(msg):
+        '''Prints a warning message.'''
+        print('{b}{prog}: {y}warning:{re} {msg}'.format(prog=__script__, msg=msg,
+            b=BOLD, y=YELLOW, re=RESET), file=sys.stderr)
+    @staticmethod
+    def info(msg='', end='\n'):
+        '''Prints an info message, only if verbose is True.'''
+        if Messages.verbose: print(msg, end=end)
+
+# Constants that define the files and values used by the Linux GPIO
+LINUX_GPIO_ROOT = '/sys/class/gpio'
+LINUX_GPIO_VALUE = os.path.join(LINUX_GPIO_ROOT, 'gpio{}', 'value')
+LINUX_GPIO_DIRECTION = os.path.join(LINUX_GPIO_ROOT, 'gpio{}', 'direction')
+LINUX_GPIO_OUT = b'out'
+LINUX_GPIO_IN = b'in'
+LINUX_GPIO_UNKNOWN = None
+LINUX_GPIO_LOW = 0
+LINUX_GPIO_HIGH = 1
+    
+class GPIO(object):
+    '''Interface with the Linux GPIO.'''
+    def __init__(self, pins):
+        # self._pins is a dictionary
+        # pin -> [fd_value, fd_direction, last_value]
+        self._pins = {}
+        for pin in pins:
+            # Open the value and direction files
+            fdval = os.open(LINUX_GPIO_VALUE.format(pin), os.O_RDWR)
+            fddir = os.open(LINUX_GPIO_DIRECTION.format(pin), os.O_WRONLY)
+            self._pins[pin] = [fdval, fddir, LINUX_GPIO_UNKNOWN]
+    def set_value(self, pin, value):
+        '''Sets the value of a GPIO pin. To do that, the right value is written
+        in the value file of the sysfs interface.'''
+        pininfo = self._pins[pin]
+        fdval, fddir, old_state = pininfo
+        if old_state != value:
+            if value == LINUX_GPIO_LOW: strvalue = b'0'
+            elif value == LINUX_GPIO_HIGH: strvalue = b'1'
+            else: raise RuntimeError('wrong gpio value in write operation')
+            write(fdval, strvalue)
+            pininfo[2] = value
+    def get_value(self, pin):
+        '''Fetch the value of the GPIO pin. In order to do that the value file
+        of the sysfs interface is read.'''
+        fd = self._pins[pin][0]
+        # Return the pointer to the begining of the file
+        lseek(fd, 0, SEEK_SET)
+        val = read(fd, 1)
+        if val == b'0': val = 0
+        elif val == b'1': val = 1
+        else:
+            RuntimeError('wrong gpio value in read operation')
+        return val
+    def set_direction(self, pin, direction):
+        '''Sets the direction of a GPIO pin. To do that, the right value is
+        written in the direction file of the sysfs interface.'''
+        pininfo = self._pins[pin]
+        if direction != LINUX_GPIO_IN and direction != LINUX_GPIO_OUT:
+            raise RuntimeError('wrong gpio direction value')
+        write(pininfo[1], direction)
+        pininfo[2] = LINUX_GPIO_UNKNOWN
+    def close(self):
+        '''Close the descriptors of the value/direction files for all pins.'''
+        for fdval, fddir, old in self._pins.values():
+            os.close(fdval)
+            os.close(fddir)
+
+class SegmentedIntelHex(intelhex.IntelHex):
+    '''Implements iteration over segments for the IntelHex objects.'''
+    def __init__(self, filename):
+        intelhex.IntelHex.__init__(self, filename)
+        self._segments = []
+        start_addr = end_addr = None
+        for addr in self.addresses():
+            if start_addr is None:
+                start_addr = end_addr = addr
+            elif addr > (end_addr + 1):
+                self._segments.append((start_addr, end_addr - start_addr + 1))
+                start_addr = end_addr = addr
+            else:
+                end_addr += 1
+        if start_addr is not None:
+            self._segments.append((start_addr, end_addr - start_addr + 1))
+    def __iter__(self):
+        for address, size in self._segments:
+            yield address, bytearray(self.tobinstr(start=address, size=size))
+
+# Constant that defines the length of a programming command
+COMMAND_LENGTH = 4
+# Constant that defines the length of the payload to send after a command
+PAYLOAD_LENGTH = 16
+# Constants that define the possible commands to send to the processor when
+# in programming mode.
+CMD_CORE_INSTRUCTION = 0x0
+CMD_TABLE_READ_POSTINC = 0x9
+CMD_TABLE_WRITE = 0xc
+CMD_TABLE_WRITE_POSTINC = 0xd
+CMD_TABLE_WRITE_PROG_POSTINC = 0xe
+# Native instructions of a PIC18 processor.
+# The constants contain the whole instruction, with the variable fields
+# (literals or memory addresses) at zero. To have a complete instruction this
+# value must be |ed with the corresponding fields.
+INSTR_NOP = 0x0000
+INSTR_MOVLW = 0x0e00
+INSTR_MOVWF = 0x6e00
+INSTR_BSF = 0x8000
+# Address of the EECON1 register. This register is used to control the read
+# and write operations in program and EEPROM memories. */
+ADDR_EECON1 = 0xa6
+# Define the addresses to activate the bulk operations in programming mode.
+ADDR_BULKREG0 = 0x3c0004
+ADDR_BULKREG1 = 0x3c0005
+# Address in program memory where the processor id is
+ADDR_PROCESSOR_ID = 0x3ffffe
+# Addresses of the TBLPTR register (uses three 8 bit registers). This register
+# is used to iterate over the program memory address.
+ADDR_TBLPTRU = 0xf8
+ADDR_TBLPTRH = 0xf7
+ADDR_TBLPTRL = 0xf6
+
+class Processor(object):
+    '''Class to read and write a PIC processor's memory.'''
+    def __init__(self, name, ident, mask, sizeprogmem):
+        self.name = name
+        '''Name of the processor (for instance, p18f26j13)'''
+        self.id = ident
+        '''Identifier number of the processor:
+        progmem[ADDR_PROCESSOR_ID:ADDR_PROCESSOR_ID+1] & mask'''
+        self.mask = mask
+        '''Used to obtain the processor identifier (see self.id)'''
+        self.sizeprogmem = sizeprogmem
+        '''Size of program memory'''
+        self._pgd_direction = None
+        '''Holds the current direction (input or output) of the PGD pin'''
+    def set_communication_parameters(self, gpio, cycle, pgc, pgd, vpp=None,
+            pgm=None):
+        self._gpio = gpio
+        '''GPIO object, interface with the Linux GPIO'''
+        self._cycle = cycle
+        '''Communication cycle time (in seconds). May be None.'''
+        self._halfcycle = None
+        '''Half communication cycle'''
+        if cycle is not None:
+            self._halfcycle = cycle / 2.0
+        self._pgc = pgc
+        '''GPIO pin number connected to processor's PGC pin'''
+        self._pgd = pgd
+        '''GPIO pin number connected to processor's PGD pin'''
+        self._vpp = vpp
+        '''GPIO pin number connected to processor's VPP pin'''
+        self._pgm = pgm
+        '''GPIO pin number connected to processor's PGM pin'''
+    def _set_pgd_direction(self, direction):
+        '''Sets the direction of the PGD pin, only if different of its current
+        direction.'''
+        if direction != self._pgd_direction:
+            self._gpio.set_direction(self._pgd, direction)
+            self._pgd_direction = direction
+    def _init_time(self):
+        '''Starts the application clock, needed to count the length of the\
+        bits.'''
+        self._timelast = time.clock()
+    def _wait_time(self, seconds):
+        '''Wait a given time in seconds and after that updates the attribute
+        time_last.'''
+        while (time.clock() - self._timelast) < seconds: pass
+    def _send_bit_fetch_on_raise(self, bit):
+        '''Sends a single bit to the processor using the GPIO. The data is
+        fetched on the raising edge by the processor.'''
+        set_value = self._gpio.set_value
+        wait_time = self._wait_time
+        pgc = self._pgc
+        halfcycle = self._halfcycle
+        # Low the clock signal and put the data bit
+        set_value(pgc, LINUX_GPIO_LOW)
+        set_value(self._pgd, bit)
+        if halfcycle is not None: wait_time(halfcycle)
+        # Raise the clock signal. Here, the processor will fetch the data bit
+        set_value(pgc, LINUX_GPIO_HIGH)
+        if halfcycle is not None: wait_time(halfcycle)
+    def check_processor_type(self):
+        '''Read from the processor's program memory its identifier and compares
+        with the expected value (self.id & self.mask).'''
+        self.read_init(ADDR_PROCESSOR_ID)
+        procid, = struct.unpack('=H', self.read_mem(2))
+        # Raise an error if the read id is unknown or the id doesn't correspond
+        # with the current processor
+        try:
+            realproc = [p for p in PROCESSORS if p.id == (procid & p.mask)][0]
+        except IndexError:
+            raise RuntimeError("unknown processor id '{:#04x}'".format(procid))
+        if realproc != self:
+            raise RuntimeError(
+                "processor mismatch: found '{}'".format(realproc.name))
+    def read_init(self, initaddr):
+        '''Prepares the processor to iterate over the program memory and read
+        bytes. To do this it is only necessary to write the address of the
+        first byte to read into the TBLPTR register.'''
+        self._write_address(initaddr)
+    def _write_address(self, address):
+        '''Writes an address to the registers TBLPTRU | TBLPTRH | TBLPTRL of
+        the processor.'''
+        command = self._command
+        send_payload = self._send_payload
+        command(CMD_CORE_INSTRUCTION)
+        send_payload(INSTR_MOVLW | ((address >> 16) & 0xff))
+        command(CMD_CORE_INSTRUCTION)
+        send_payload(INSTR_MOVWF | ADDR_TBLPTRU)
+        command(CMD_CORE_INSTRUCTION)
+        send_payload(INSTR_MOVLW | ((address >> 8) & 0xff))
+        command(CMD_CORE_INSTRUCTION)
+        send_payload(INSTR_MOVWF | ADDR_TBLPTRH)
+        command(CMD_CORE_INSTRUCTION)
+        send_payload(INSTR_MOVLW | (address & 0xff))
+        command(CMD_CORE_INSTRUCTION)
+        send_payload(INSTR_MOVWF | ADDR_TBLPTRL)
+    def _command(self, cmd):
+        '''Sends a 4 bit command.'''
+        # If the last command was a table read, the PGD pin may still be
+        # configured as input. In that case, after the first raising edge of
+        # PGC, the PGD pin might be changed to output (only if it was input
+        # before). To achieve this, the direction of the PGD pin must be stored
+        # (self._pgd_direction attribute) and a method to change its direction
+        # must be used (self._set_data_direction). Originally, after a read
+        # the PGD pin direction was changed at the end of the read_mem
+        # function, but this approach didn't work for the pic18fxxjxx family.
+        self._send_bit_output(cmd & 1)
+        self._send_bit_sequence(cmd >> 1, COMMAND_LENGTH - 1)
+    def _send_bit_output(self, bit):
+        '''Sends a single bit to the processor using the GPIO.
+        If the bit was configured as an input, change it to an output.'''
+        set_value = self._gpio.set_value
+        wait_time = self._wait_time
+        pgc = self._pgc
+        halfcycle = self._halfcycle
+        set_value(pgc, LINUX_GPIO_HIGH)
+        # Set the data signal mode as output if necessary
+        self._set_pgd_direction(LINUX_GPIO_OUT)
+        set_value(self._pgd, bit)
+        if halfcycle is not None: wait_time(halfcycle)
+        # Low the clock signal. Here, the processor will fetch the data bit
+        set_value(pgc, LINUX_GPIO_LOW)
+        if halfcycle is not None: wait_time(halfcycle)
+    def _send_bit_sequence(self, sequence, length):
+        '''Sends a sequence of length data bits (the lower bits in sequence)
+        to the processor using the GPIO.'''
+        for i in range(length):
+            self._send_bit(sequence & 1);
+            sequence >>= 1
+    def _send_bit(self, bit):
+        '''Sends a single bit to the processor using the GPIO.'''
+        # Raise the clock signal and put the data bit
+        set_value = self._gpio.set_value
+        wait_time = self._wait_time
+        pgc = self._pgc
+        halfcycle = self._halfcycle
+        set_value(pgc, LINUX_GPIO_HIGH)
+        set_value(self._pgd, bit)
+        if halfcycle is not None: wait_time(halfcycle)
+        # Low the clock signal. Here, the processor will fetch the data bit
+        set_value(pgc, LINUX_GPIO_LOW)
+        if halfcycle is not None: wait_time(halfcycle)
+    def _send_payload(self, payload):
+        '''Sends the payload after a command.'''
+        self._send_bit_sequence(payload, PAYLOAD_LENGTH)
+    def read_mem(self, size):
+        '''Reads size bytes of the PIC flash program memory. read_init function
+        must be called befor calling this function. Return the sequence of
+        bytes read.'''
+        set_value = self._gpio.set_value
+        wait_time = self._wait_time
+        pgc = self._pgc
+        halfcycle = self._halfcycle
+        mem = bytearray()
+        for j in range(size):
+            byte = 0
+            self._command(CMD_TABLE_READ_POSTINC)
+            # Send 8 zeroes
+            self._send_bit_sequence(0, 8)
+            # Set PGD as input
+            self._set_pgd_direction(LINUX_GPIO_IN)
+            # Read the 8 bits of the response
+            for i in range(8):
+                set_value(pgc, LINUX_GPIO_HIGH)
+                if halfcycle is not None: wait_time(halfcycle)
+                set_value(pgc, LINUX_GPIO_LOW)
+                # Fetch the bit when the clock goes low
+                bit = self._gpio.get_value(self._pgd)
+                byte |= (bit << i)
+                if halfcycle is not None: wait_time(halfcycle)
+            mem.append(byte)
+        # Originally, the PGD pin was made output again here. This approach
+        # worked fine for the family pic18fxxxx but not for the pic18fxxjxx.
+        # For the last one, the PGD must become output again after the first
+        # PGC raising edge of the next command.
+        return mem
+
+class P18fxxjxx(Processor):
+    '''To write the PIC p18fxxjxx family processors.'''
+    # Define minimum times to assure the correct write of bytes in memory
+    # (in seconds)
+    _TIME_P5 = 0.00000005
+    _TIME_P9 = 0.0034
+    _TIME_P10 = 0.054
+    _TIME_P11 = 0.524
+    _TIME_P12 = 0.0004
+    _TIME_P19 = 0.004
+    _TIME_P20 = 0.00000005
+    # The key to send to enter program mode
+    _KEY = 0x4d434850
+    _KEY_SIZE = 32
+    # Define the values to write in order to activate the bulk operations in
+    # programming mode.
+    _BULKCMD = 0x0180
+    # Define single bits positions in the EECON1 register
+    _BIT_WREN = 0x400
+    # Size of the write buffer
+    _WBUFFER_SIZE = 64
+    def __contains__(self, address):
+        '''Check if an address is in range of program memory.'''
+        return address >= 0 and address < self.sizeprogmem
+    def enter_program_mode(self):
+        '''Make the processor enter ICSP program/verify mode.'''
+        # Verify is vpp is given, error otherwise
+        if self._vpp is None:
+            raise RuntimeError('Vpp needed for this family of processors')
+        # Set pgc, pgd, and vpp low. Make sure they are configured as outputs.
+        self._gpio.set_direction(self._pgc, LINUX_GPIO_OUT)
+        self._set_pgd_direction(LINUX_GPIO_OUT)
+        self._gpio.set_direction(self._vpp, LINUX_GPIO_OUT)
+        self._gpio.set_value(self._pgc, LINUX_GPIO_LOW)
+        self._gpio.set_value(self._pgd, LINUX_GPIO_LOW)
+        self._gpio.set_value(self._vpp, LINUX_GPIO_LOW)
+        # As we have to start sending bits, initialize the time clock
+        self._init_time()
+        # Send a pulse through Vpp
+        self._gpio.set_value(self._vpp, LINUX_GPIO_HIGH)
+        self._gpio.set_value(self._vpp, LINUX_GPIO_LOW)
+        self._wait_time(self._TIME_P19)
+        # Send the key
+        self._send_bit_sequence_msb(self._KEY, self._KEY_SIZE)
+        # The PGC should be left low
+        self._gpio.set_value(self._pgc, LINUX_GPIO_LOW)
+        self._wait_time(self._TIME_P20)
+        # Raise Vpp and mantain it that way
+        self._gpio.set_value(self._vpp, LINUX_GPIO_HIGH)
+        self._wait_time(self._TIME_P12)
+    def _send_bit_sequence_msb(self, sequence, size):
+        '''Sends a sequence of size data bits (the upper bits in seq) to the
+        processor using the GPIO, most significant bit first.'''
+        for i in range(size):
+            self._send_bit_fetch_on_raise(1 if sequence & 0x80000000 else 0)
+            sequence <<= 1
+    def exit_program_mode(self):
+        '''Exits the program mode, means set PGC, PGD and VPP signals in the
+        proper state to end the communication with the processor.
+        The sequence is: pgc and pgd are set low, then vpp is set low.'''
+        self._gpio.set_value(self._pgc, LINUX_GPIO_LOW)
+        # In a read operation, PGD remains input. In case that was the last
+        # operation performed, leave it as an output.
+        self._set_pgd_direction(LINUX_GPIO_OUT)
+        self._gpio.set_value(self._pgd, LINUX_GPIO_LOW)
+        self._gpio.set_value(self._vpp, LINUX_GPIO_LOW)
+    def bulk_erase(self):
+        '''Erases the whole PIC flash program memory.'''
+        # Write the correct values in the bulk register in order to activate
+        # the bulk operation.
+        cmdh = (self._BULKCMD & 0xff00) | ((self._BULKCMD >> 8) & 0x00ff)
+        cmdl = (self._BULKCMD & 0x00ff) | ((self._BULKCMD << 8) & 0xff00)
+        self._write_address(ADDR_BULKREG1)
+        self._command(CMD_TABLE_WRITE)
+        self._send_payload(cmdh)
+        self._write_address(ADDR_BULKREG0)
+        self._command(CMD_TABLE_WRITE)
+        self._send_payload(cmdl)
+        self._command(CMD_CORE_INSTRUCTION)
+        self._send_payload(INSTR_NOP)
+        # Wait after the NOP instruction
+        self._command(CMD_CORE_INSTRUCTION)
+        halfcycle = self._halfcycle if self._halfcycle is not None else 0.0
+        self._wait_time(self._TIME_P11 + self._TIME_P10 - halfcycle)
+        # Send the last payload (zeroes)
+        self._send_payload(0)
+    def write_program(self, program):
+        '''Write the given program to program memory.'''
+        # Initialize some internal attributes
+        self._write_start_address = None
+        self._write_buffer = None
+        self._write_pointer = -1
+        # Enable writing in program memory
+        self._command(CMD_CORE_INSTRUCTION)
+        self._send_payload(INSTR_BSF | ADDR_EECON1 | self._BIT_WREN)
+        # Write the program
+        for address, data in program:
+            self._write_mem(address, data)
+        self._write_flush()
+        # Read back and check the program memory
+        for address, data in program:
+            self.read_init(address)
+            b = self.read_mem(len(data))
+            for i in range(len(data)):
+                if b[i] != data[i]:
+                    Messages.error('program location {:08x} is different from '
+                        'expected'.format(address + i))
+    def _write_mem(self, address, data):
+        '''Write data bytes starting at address to the processor.'''
+        maxsize = self._WBUFFER_SIZE
+        flush = self._write_flush
+        startaddr = self._write_start_address
+        writebuf = self._write_buffer
+        # For the first pass, initialize the start address and the write buffer
+        if startaddr is None:
+            startaddr = address
+            writebuf = bytearray(0xff for i in range(maxsize))
+        for b in data:
+            if address >= (startaddr + maxsize):
+                # Flush accesses to _write_start_address and _write_buffer
+                self._write_start_address = startaddr
+                self._write_buffer = writebuf
+                flush()
+                startaddr = address
+                writebuf = bytearray(0xff for i in range(maxsize))
+            writebuf[address - startaddr] = b
+            address += 1
+        self._write_start_address = startaddr
+        self._write_buffer = writebuf
+    def _write_flush(self):
+        '''Send the contents of the write buffer.'''
+        # Calculate the number of bytes to write. This can only be less than
+        # the write buffer size if we are writing at the end of the program
+        # memory
+        buf = self._write_buffer
+        cmd = self._command
+        sendpld = self._send_payload
+        writeaddr = self._write_start_address
+        bufsize = self._WBUFFER_SIZE
+        size = (bufsize if (writeaddr + bufsize) <= self.sizeprogmem
+            else self.sizeprogmem - writeaddr)
+        # Check if the write pointer must be modified
+        if self._write_pointer != writeaddr:
+            self._write_address(writeaddr)
+            self._write_pointer = writeaddr
+        # Write the data
+        for i in range(0, size - 2, 2):
+            cmd(CMD_TABLE_WRITE_POSTINC)
+            sendpld(buf[i] | (buf[i + 1] << 8))
+        # Write the last word and start programming.
+        cmd(CMD_TABLE_WRITE_PROG_POSTINC)
+        sendpld(buf[size - 2] | (buf[size - 1] << 8))
+        self._send_p9_p5_sequence()
+        self._write_pointer += bufsize
+    def _send_p9_p5_sequence(self):
+        '''Sends the P9 and P5 sequence. This sequence must be sent in order to
+        write to the program memory. The sequence is a NOP core instruction
+        (command bits 0000 and payload all zeroes), but when sending the fourth
+        bit of the command, the clock signal must be hold high for the time P9,
+        and after that low for the time P5. Once the command's four bits are
+        completed in this way, the payolad of zeroes must be sent.'''
+        self._send_bit_sequence(0, COMMAND_LENGTH - 1)
+        # Set PGC and wait P9
+        self._gpio.set_value(self._pgc, LINUX_GPIO_HIGH)
+        self._wait_time(self._TIME_P9)
+        # Clear PGC and wait P5
+        self._gpio.set_value(self._pgc, LINUX_GPIO_LOW)
+        self._wait_time(self._TIME_P5)
+        # Send the payload (bits to 0)
+        self._send_payload(0)
+
+PROCESSORS = [
+    P18fxxjxx('p18f24j10', 0x1d00, 0xffe0, 0x4000),
+    P18fxxjxx('p18f24j11', 0x4d80, 0xffe0, 0x4000),
+    P18fxxjxx('p18f24j50', 0x4c00, 0xffe0, 0x4000),
+    P18fxxjxx('p18f25j10', 0x1c00, 0xffe0, 0x8000),
+    P18fxxjxx('p18f25j11', 0x4da0, 0xffe0, 0x8000),
+    P18fxxjxx('p18f25j50', 0x4c20, 0xffe0, 0x8000),
+    P18fxxjxx('p18f26j11', 0x4dc0, 0xffe0, 0x10000),
+    P18fxxjxx('p18f26j13', 0x5920, 0xffe0, 0x10000),
+    P18fxxjxx('p18f26j50', 0x4c40, 0xffe0, 0x10000),
+    P18fxxjxx('p18f26j53', 0x5820, 0xffe0, 0x10000),
+    P18fxxjxx('p18f27j13', 0x5960, 0xffe0, 0x20000),
+    P18fxxjxx('p18f27j53', 0x5860, 0xffe0, 0x20000),
+    P18fxxjxx('p18f44j10', 0x1d20, 0xffe0, 0x4000),
+    P18fxxjxx('p18f44j11', 0x4de0, 0xffe0, 0x4000),
+    P18fxxjxx('p18f44j50', 0x4c60, 0xffe0, 0x4000),
+    P18fxxjxx('p18f45j10', 0x1c20, 0xffe0, 0x4000),
+    P18fxxjxx('p18f45j11', 0x4e00, 0xffe0, 0x4000),
+    P18fxxjxx('p18f45j50', 0x4c80, 0xffe0, 0x4000),
+    P18fxxjxx('p18f46j11', 0x4e20, 0xffe0, 0x10000),
+    P18fxxjxx('p18f46j13', 0x59a0, 0xffe0, 0x10000),
+    P18fxxjxx('p18f46j50', 0x4ca0, 0xffe0, 0x10000),
+    P18fxxjxx('p18f46j53', 0x58a0, 0xffe0, 0x10000),
+    P18fxxjxx('p18f47j13', 0x59e0, 0xffe0, 0x20000),
+    P18fxxjxx('p18f47j53', 0x58e0, 0xffe0, 0x20000),
+    P18fxxjxx('p18lf24j10', 0x1d40, 0xffe0, 0x4000),
+    P18fxxjxx('p18lf24j11', 0x4e40, 0xffe0, 0x4000),
+    P18fxxjxx('p18lf24j50', 0x4cc0, 0xffe0, 0x4000),
+    P18fxxjxx('p18lf25j10', 0x1c40, 0xffe0, 0x8000),
+    P18fxxjxx('p18lf25j11', 0x4e60, 0xffe0, 0x8000),
+    P18fxxjxx('p18lf25j50', 0x4ce0, 0xffe0, 0x8000),
+    P18fxxjxx('p18lf26j11', 0x4e80, 0xffe0, 0x10000),
+    P18fxxjxx('p18lf26j13', 0x5b20, 0xffe0, 0x10000),
+    P18fxxjxx('p18lf26j50', 0x4d00, 0xffe0, 0x10000),
+    P18fxxjxx('p18lf26j53', 0x5a20, 0xffe0, 0x10000),
+    P18fxxjxx('p18lf27j13', 0x5b60, 0xffe0, 0x20000),
+    P18fxxjxx('p18lf27j53', 0x5a60, 0xffe0, 0x20000),
+    P18fxxjxx('p18lf44j10', 0x1d60, 0xffe0, 0x4000),
+    P18fxxjxx('p18lf44j11', 0x4ea0, 0xffe0, 0x4000),
+    P18fxxjxx('p18lf44j50', 0x4d20, 0xffe0, 0x4000),
+    P18fxxjxx('p18lf45j10', 0x1c60, 0xffe0, 0x8000),
+    P18fxxjxx('p18lf45j11', 0x4ec0, 0xffe0, 0x8000),
+    P18fxxjxx('p18lf45j50', 0x4d40, 0xffe0, 0x8000),
+    P18fxxjxx('p18lf46j11', 0x4ee0, 0xffe0, 0x10000),
+    P18fxxjxx('p18lf46j13', 0x5ba0, 0xffe0, 0x10000),
+    P18fxxjxx('p18lf46j50', 0x4d60, 0xffe0, 0x10000),
+    P18fxxjxx('p18lf46j53', 0x5aa0, 0xffe0, 0x10000),
+    P18fxxjxx('p18lf47j13', 0x5be0, 0xffe0, 0x20000),
+    P18fxxjxx('p18lf47j53', 0x5ae0, 0xffe0, 0x20000),
+]
+
+# Default values for some options
+DEFAULT_CYCLE = None
+DEFAULT_PGC = 0
+DEFAULT_PGD = 1
+DEFAULT_PGM = None
+DEFAULT_VPP = None
+
+def _parse_options(sysconf):
+    '''Parse the command line options.
+    sysconf is a dictionary with some default options.
+    '''
+    parser = argparse.ArgumentParser(prog=__script__, epilog=HELP_EPILOG,
+        formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument('-a', '--address', type=lambda i: int(i, 0),
+        help='Initial address for PIC memory read')
+    parser.add_argument('-c', '--cycle', type=float,
+        default=sysconf['cycle'] if 'cycle' in sysconf else DEFAULT_CYCLE,
+        help='Set the period (in nanoseconds) for the clock signal')
+    parser.add_argument('-l', '--list', action='store_true',
+        help='List the PIC processors supported by this software')
+    parser.add_argument('-C', '--pgc', type=int,
+        default=sysconf['pgc'] if 'pgc' in sysconf else DEFAULT_PGC,
+        help='Set the GPIO pin number used by the clock signal')
+    parser.add_argument('-D', '--pgd', type=int,
+        default=sysconf['pgd'] if 'pgd' in sysconf else DEFAULT_PGD,
+        help='Set the GPIO pin number used by the data signal')
+    parser.add_argument('-M', '--pgm', type=int,
+        default=sysconf['pgm'] if 'pgm' in sysconf else DEFAULT_PGM,
+        help='Set the GPIO pin number used by the program signal')
+    parser.add_argument('-p', '--processor', default=sysconf['processor']
+            if 'processor' in sysconf else PROCESSORS[0].name,
+        help='Choose the processor, only for pretend mode')
+    parser.add_argument('-r', '--read', action='store_true',
+        help='Read the contents of the PIC memory')
+    parser.add_argument('-s', '--size', type=int,
+        help='Size of PIC memory to read')
+    parser.add_argument('-v', '--verbose', action='store_true',
+        help='Show more information about the execution')
+    parser.add_argument('-V', '--vpp', type=int,
+        default=sysconf['vpp'] if 'vpp' in sysconf else DEFAULT_VPP,
+        help='Set the GPIO pin number used by the Vpp signal')
+    parser.add_argument('--version', action='version', version=VERSION_STRING)
+    parser.add_argument('file', nargs='?',
+        help='The program file to download to the processor')
+    args = parser.parse_args()
+    
+    # If the option list is selected, print the processors list and don't
+    # check anything else.
+    if args.list:
+        print('\n'.join([p.name for p in PROCESSORS]))
+        sys.exit()
+    
+    # Get the processor to use
+    try:
+        processor = [p for p in PROCESSORS if p.name == args.processor][0]
+    except IndexError:
+        Messages.error(
+            'wrong processor (see {prog} --list)'.format(prog=__script__))
+
+    # Issue an error if pgm is used but not vpp
+    if args.pgm is not None and args.vpp is None:
+        Messages.error(
+            'pgm option (low-voltage program mode) requires vpp option')
+
+    # Issue a warning if address or size options used but not in read mode
+    if args.address is not None:
+        if not args.read:
+            warn('address option only used in read mode')
+        else:
+            if args.address < 0 or args.address > ADDR_PROCESSOR_ID + 1:
+                Messages.error('address must be a numeric value in the range '
+                    '000000:{:06x}'.format(ADDR_PROCESSOR_ID + 1))
+    if args.size is not None and not args.read:
+        Messages.warn('size option only used in read mode')
+
+    # Check that there's input file if needed
+    if not args.read and args.file is None:
+        Messages.error('no input file')
+
+    # Set the verbose flag in the Messages class
+    Messages.verbose = args.verbose
+
+    # If in verbose mode, print the given parameters
+    Messages.info('using GPIO pins PGC: {}, PGD: {}'.format(
+        args.pgc, args.pgd), end='')
+    if args.vpp is not None:
+        Messages.info(', Vpp: {}'.format(args.vpp), end='')
+    if args.pgm is not None:
+        Messages.info(', PGM: {}'.format(args.pgm), end='')
+    Messages.info()
+    Messages.info('processor: {}'.format(processor.name))
+    Messages.info('cycle: {} s'.format(
+        args.cycle if args.cycle is not None else 0))
+    return processor, args
+
+# Configuration file with the default values
+CONF_FILE = 'picgp.conf'
+
+def _load_sysconfig():
+    '''Load default values for some parameters stored in the file CONF_FILE.'''
+    config = {}
+    # Check the existance of the configuration file relative to this script
+    prefix = os.path.dirname(os.path.dirname(os.path.abspath(sys.argv[0])))
+    config_file = os.path.join(prefix, 'etc', CONF_FILE)
+    if not os.path.exists(config_file):
+        # Not found, try in /etc
+        config_file = os.path.join('/etc', CONF_FILE)
+    try:
+        f = open(config_file, 'r')
+        for line in f:
+            # Discard comments and empty lines
+            if line.startswith('#') or line == '\n': continue
+            s = line.split('=')
+            if len(s) == 2:
+                key, val = s[0].strip(), s[1].strip()
+                config[key] = int(val) if key in [
+                    'cycle', 'pgc', 'pgm', 'vpp'] else val
+        f.close()
+    except: pass
+    return config
+
+def _init_gpio(options):
+    '''Initialize the necessary pins of the Linux GPIO.'''
+    pins = [options.pgc, options.pgd]
+    if options.pgm is not None:
+        pins.append(options.pgm)
+    if options.vpp is not None:
+        pins.append(options.vpp)
+    return GPIO(pins)
+
+def _read_pic(processor, options):
+    '''Read the program memory and print its contents.
+    If the option address is given, then the memory is read starting at that
+    address. Otherwise, the memory is read from the address 0.
+    If the option size if given, size bytes are read from memory. Otherwise,
+    the last position read is processor->sizeprocmem - 1.'''
+    _init_communication(processor)
+    # Get the number of bytes to read and the starting address
+    start_address = options.address if options.address is not None else 0
+    end_address = (start_address + options.size
+        ) if options.size is not None else processor.sizeprocmem
+    end_address = min(end_address, ADDR_PROCESSOR_ID + 2)
+    # Read the processor's memory
+    processor.read_init(start_address)
+    data = processor.read_mem(end_address - start_address)
+    # Use an IntelHex instance to print the read bytes
+    ih = intelhex.IntelHex()
+    ih.puts(start_address, bytes(data))
+    ih.dump()
+    processor.exit_program_mode()
+
+def _init_communication(processor):
+    '''Initializes the communication with the processor and checks its id.'''
+    processor.enter_program_mode()
+    # Read the processor's ID and obtain the processor's characteristics
+    Messages.info('reading device id...')
+    processor.check_processor_type()
+    Messages.info(processor.name)
+
+def _check_program_memory(processor, program):
+    '''Checks that the addresses used by the program (from the hex file) are
+    in the processor's defined memory areas.'''
+    for a in program.addresses():
+        if not a in processor:
+            Messages.error('address {address:08x} points to non-implemented '
+                'program memory'.format(address=a))
+    Messages.info('program memory (used/total): {used}/{total} bytes'.format(
+        used=len(program), total=processor.sizeprogmem))
+
+def _write_pic(processor, options=None):
+    '''Function that performs the steps to write the different segments in the
+    processor memory.'''
+    # Read and decode the input program file
+    program = SegmentedIntelHex(options.file)
+    # Check that the given program fits in the device's memory
+    _check_program_memory(processor, program)
+    _init_communication(processor)
+    # Bulk erase
+    Messages.info('performing bulk erase...')
+    processor.bulk_erase()
+    # Write the program
+    Messages.info('writing program memory...')
+    processor.write_program(program)
+    processor.exit_program_mode()
+
+def _time(function, processor, options):
+    def wrapped():
+        return function(processor, options)
+    s = timeit.timeit(wrapped, number=1)
+    Messages.info('time: {:.3f}'.format(s))
+
+def main():
+    # Load the user preferred values
+    sysconf = _load_sysconfig()
+    processor, options = _parse_options(sysconf)
+    try:
+        gpio = _init_gpio(options)
+        processor.set_communication_parameters(gpio, options.cycle,
+            options.pgc, options.pgd, options.vpp, options.pgm)
+        if options.read:
+            _time(_read_pic, processor, options)
+        else:
+            _time(_write_pic, processor, options)
+        gpio.close()
+    except (IOError, RuntimeError) as e:
+        Messages.error(str(e))
+
+if __name__ == '__main__':
+    main()
+

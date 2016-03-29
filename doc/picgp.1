@@ -1,0 +1,173 @@
+.TH PICGP 1
+.SH NAME
+picgp \- PIC microcontrollers programmer using the computer's GPIO
+.SH SYNOPSIS
+\fBpicgp\fR [\fB\-c \fItime\fR] [\fB\-C \fIclock_pin\fR]
+[\fB\-D \fIdata_pin\fR] [\fB\-M \fIpgm_pin\fR] [\fB\-V \fIvpp_pin\fR]
+      [\fB\-v\fR] [\fB\-p \fIprocessor\fR] \fIfilename\fR
+.br
+\fBpicgp \-r\fR [\fB\-a \fIaddress\fR] [\fB\-c \fIcycle\fR]
+[\fB\-C \fIclock_pin\fR] [\fB\-D \fIdata_pin\fR]
+         [\fB\-M \fIpgm_pin\fR] [\fB\-V \fIvpp_pin\fR]
+[\fB\-s \fIsize\fR] [\fB\-v\fR] [\fB\-p \fIprocessor\fR]
+.br
+(See the OPTIONS section for alternate option syntax with long option names.)
+
+.SH DESCRIPTION
+.B picgp
+is a programmer for Microchip PIC microcontrollers. It reads the program from
+the input file \fIfilename\fR, in the Intel HEX format, and then downloads it
+to the microcontroller's program memory using the computer's GPIO.
+Currently, only the Linux's sysfs GPIO interface is supported. As for the
+processors, only some processors of the PIC18 family are supported (to see the
+exact list of supported processors use the \fB\-l\fR option).
+.PP
+\fBpicgp\fR has two main modes of operation: write mode (not \fB\-r\fR
+option given) and read mode (\fB\-r\fR option given). In write mode, the input
+file is downloaded into the microcontroller's program memory. In read mode, the
+microcontroller's program memory is totally or partially read and its contents
+dumped to standard output.
+.PP
+To avoid writing long command lines, the options \fBpgc\fR, \fBpgd\fR,
+\fBpgm\fR, \fBvpp\fR, \fBprocessor\fR and \fBcycle\fR may be given in the
+configuration file /etc/picgp.conf . This file should contain lines in the
+format \fIoption\fR=\fIvalue\fR.
+.PP
+\fIExample\fR (/etc/picgp.conf):
+.br
+pgc=23
+.br
+pgd=22
+.br
+vpp=18
+.br
+processor=pic18f2550
+
+.SH OPTIONS
+.TP
+.BR \-a " " \fIaddress\fR ", " \-\-address =\fIaddress\fR
+In read mode (option \fB\-r\fR) gives the start address at which the
+processor's program memory must be read. If not given, the program memory is
+read starting at address 0. In write mode, this option is ignored.
+.TP
+.BR \-C " " \fIclock_pin\fR ", " \-\-pgc =\fIclock_pin\fR
+Selects the number of the GPIO pin to be used to generate the programming
+clock signal. This GPIO pin must be connected to the PGC pin in the PIC
+processor.
+.TP
+.BR \-c " " \fItime\fR ", " \-\-cycle =\fItime\fR
+Gives the value, in seconds (float), for the programming clock signal's period.
+This value, however, is limited for the computer's processor speed and Linux
+Real Time clock precision, so maybe values under a few microseconds won't make
+the thing go faster. If not given, the program will send the bits as fast
+as possible.
+.TP
+.BR \-D " " \fIdata_pin\fR ", " \-\-pgd =\fIdata_pin\fR
+Selects the number of the GPIO pin to be used to generate the programming
+data signal and to read input data from the PIC processor. This GPIO pin must
+be connected to the PGD pin in the PIC processor.
+.TP
+.BR \-h ", " \-\-help
+Displays usage information and exits.
+.TP
+.BR \-l ", " \-\-list
+List all the supported PIC processors and exits.
+.TP
+.BR \-M " " \fIpgm_pin\fR ", " \-\-pgm =\fIpgm_pin\fR
+Selects the number of the GPIO pin to be used to generate the programming
+enable signal, used in the Low Voltage Programming mode. This signal is only
+used by some processors and only if option \fB\-V\fR is also given. This GPIO
+pin must be connected to the PGM pin in the PIC processor.
+.TP
+.BR \-p " " \fIprocessor\fR ", " \-\-processor =\fIprocessor\fR
+Selects the PIC processor being programmed or read. \fIprocessor\fR must be
+one within the list given by the \fB\-l\fR option. The PIC model is also read
+from the processor's program memory at the beginning of the operation and if
+doesn't match the given processor the program will exit with error. The
+processor must be given in order to use the correct sequence to enter the
+programming mode.
+.TP
+.BR \-r ", " \-\-read
+Read the processor's program memory and dump it in the standard otuput. If the
+option \fB\-a\fR is given, the program memory is read starting at the address
+given by that option. Otherwise, the program memory is read from the address
+0. If the option \fB\-s\fR is given, only the number of bytes specified by that
+option are read. Otherwise, the program memory is read to the last
+implemented address.
+.TP
+.BR \-s " " \fImemsize\fR ", " \-\-size =\fImemsize\fR
+Give the number of bytes to read from the processor's program memory. If not
+given, the program memory is read to the last implemented address. This
+option is only used in read mode (option \fB\-r\fR).
+.TP
+.BR \-\-version
+Prints the version number and the license statement, and then exits.
+.TP
+.BR \-V " " \fIvpp_pin\fR ", " \-\-vpp =\fIvpp_pin\fR
+Selects the number of the GPIO pin to be used to control the MCLR/Vpp signal,
+used to reset the processor as well as to enter the programming mode. This GPIO
+pin must be connected to the MCLR/Vpp pin in the PIC processor. Note that this
+GPIO pin can only be connected directly to the PIC correspondant pin in Low
+Voltage Programming mode. In order to use High Voltage Programming, this signal
+has to be used to drive a circuit that will feed a high voltage signal to the
+MCLR/Vpp pin in the PIC. If this option is not given, the sequence for
+entering the programming mode (either Low Voltage or High Voltage) must be
+manually performed by the user in hardware, and PGC and PGD must be low before
+launching \fBpicgp\fR.
+.TP
+.BR \-v ", " \-\-verbose
+Prints in stantard output some information as the operation takes place.
+
+.SH EXIT STATUS
+The exit status is 0 if the execution completed without errors (in write mode
+the program was successfully downloaded to the processor's program memory, and
+in read mode the processor's program memory was successfully read) or 1 if
+some errors occurred. In the later case, an error message is printed to
+standard error.
+.SH COPYRIGHT
+Copyright 2016 Antonio Serrano Hernandez
+.PP
+This man page is part of picgp.
+.PP
+picgp is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+.PP
+picgp is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+.PP
+You should have received a copy of the GNU General Public License
+along with picgp; see the file COPYING.  If not, see
+<http://www.gnu.org/licenses/>.
+.SH NOTES
+See the Microchip's datasheets for more information on how the programming
+sequence works. See the EXAMPLES section for specific cases.
+.PP
+In general, the files in sysfs that conforms the user interface to the GPIO
+are only accessible by the root user. If a user different from the root wants
+to execute \fBpicgp\fR, the permissions of these files must be adjusted
+accordingly.
+.SH BUGS
+Report bugs to <toni.serranoh@gmail.com>.
+.SH EXAMPLE
+In these examples, the PGC, PGD, Vpp processor's pins are connected to
+the pins 0, 1, and 2 respectively of the computer's GPIO port.
+.SS "Write mode"
+.RS 7
+picgp -C 0 -D 1 -V 2 -p p18f26j13 program.hex
+.RE
+.SS "Read mode"
+.RS 7
+picgp -r -C 0 -D 1 -V 2 -p p18f26j13
+.RE
+.SS "Read the configuration word"
+.RS 7
+picgp -r -a 0xfff8 -s 8 -C 0 -D 1 -V 2 -p p18f26j13
+.RE
+.SH SEE ALSO
+PIC18F2XJXX/4XJXX family Flash Microcontroller Programming Specification:
+.br
+http://ww1.microchip.com/downloads/en/DeviceDoc/39687e.pdf
